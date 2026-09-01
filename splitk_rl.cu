@@ -54,12 +54,17 @@ int main() {
     printf("flips   = tokens whose PPO clip status changed, out of %d.\n", NTOK);
     printf("          Ratios are pre-seeded across [0.75,1.25] so the 0.8/1.2\n");
     printf("          boundaries are populated. Without this the test is vacuous.\n");
-    printf("at-risk = tokens sitting within the measured perturbation of a\n");
-    printf("          boundary. A token can only flip if it is this close.\n");
-    printf("          Expect 0 flips; the honest statement is the WINDOW, not\n");
-    printf("          the flip count -- with %d samples over a 0.5-wide range the\n", NTOK);
-    printf("          gap between adjacent ratios is ~%.1e, far above the noise.\n",
+    printf("flip ev = flip events, out of (runs-1) x tokens = %d.\n", (RUNS - 1) * NTOK);
+    printf("flip tok= distinct tokens that ever flipped, out of %d.\n", NTOK);
+    printf("at-risk = tokens within the measured perturbation of a boundary.\n");
+    printf("          Sensitivity check on an artificial evenly spaced ratio grid.\n");
+    printf("          It does NOT estimate how many tokens in real RL are at risk.\n");
+    printf("\nThe primary result is the WINDOW, not the flip count. Adjacent seeded\n");
+    printf("ratios are ~%.1e apart, far above the perturbation, so zero flips is\n",
            0.50 / (NTOK - 1));
+    printf("expected and carries little information. Read it as: the largest\n");
+    printf("perturbation was X, so a token must sit within about X of 0.8 or 1.2\n");
+    printf("for this effect alone to change its clip status.\n");
 
     int Ks[] = {4096, 16384};
     int Sv[] = {2, 4, 8, 16, 32};
@@ -101,9 +106,9 @@ int main() {
         std::vector<double> lp1; all_lp(lg1, lp1);
 
         printf("\nK = %d\n", K);
-        printf("%7s %13s %13s %13s %13s %7s %8s\n",
+        printf("%7s %13s %13s %13s %13s %9s %9s %8s\n",
                "splits", "NONDET dlp", "NONDET |r-1|", "ALGO dlp", "ALGO |r-1|",
-               "flips", "at-risk");
+               "flip ev", "flip tok", "at-risk");
 
         for (int si = 0; si < 5; si++) {
             int S = Sv[si];
@@ -112,7 +117,8 @@ int main() {
             launch(S, lg0); all_lp(lg0, lp0);
 
             double ndDlp = 0, algDlp = 0;
-            int flips = 0;
+            long flipEvents = 0;
+            std::vector<char> everFlipped(NTOK, 0);
             for (int i = 0; i < NTOK; i++)
                 algDlp = std::max(algDlp, fabs(lp0[i] - lp1[i]));
 
@@ -125,7 +131,7 @@ int main() {
                     double oldLp = lp0[i] - log(ratioTarget[i]);
                     double r0 = exp(lp0[i] - oldLp), r1 = exp(lpr[i] - oldLp);
                     bool c0 = (r0 < 0.8 || r0 > 1.2), c1 = (r1 < 0.8 || r1 > 1.2);
-                    if (c0 != c1) flips++;
+                    if (c0 != c1) { flipEvents++; everFlipped[i] = 1; }
                 }
             }
             double win = exp(ndDlp) - 1.0;     // ratio-space perturbation
@@ -134,8 +140,10 @@ int main() {
                 double r = ratioTarget[i];
                 if (fabs(r - 0.8) < r * win || fabs(r - 1.2) < r * win) atRisk++;
             }
-            printf("%7d %13.3e %13.3e %13.3e %13.3e %7d %8d\n",
-                   S, ndDlp, win, algDlp, exp(algDlp) - 1.0, flips, atRisk);
+            int flipTok = 0;
+            for (int i = 0; i < NTOK; i++) flipTok += everFlipped[i];
+            printf("%7d %13.3e %13.3e %13.3e %13.3e %9ld %9d %8d\n",
+                   S, ndDlp, win, algDlp, exp(algDlp) - 1.0, flipEvents, flipTok, atRisk);
         }
         CK(cudaFree(dA)); CK(cudaFree(dB)); CK(cudaFree(dC));
     }

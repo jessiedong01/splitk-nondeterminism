@@ -73,7 +73,7 @@ int main() {
     cudaDeviceProp p;
     CK(cudaGetDeviceProperties(&p, 0));
     printf("%s (sm_%d%d)\n", p.name, p.major, p.minor);
-    printf("Cost of determinism. Fixed-order split-K uses two kernels and a\n");
+    printf("Cost of determinism IN THIS CUSTOM KERNEL. Not a general result. Fixed-order split-K uses two kernels and a\n");
     printf("preallocated workspace; both are included in its time.\n");
     printf("repro = fixed-order result bit-identical across %d runs.\n\n", ITERS);
 

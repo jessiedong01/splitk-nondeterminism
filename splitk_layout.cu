@@ -1,3 +1,4 @@
+// Does the block->element mapping decide whether split-K is reproducible?
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -6,17 +7,18 @@
 #include <vector>
 #include <algorithm>
 #include "check.cuh"
+#include "order_probe.cuh"
 
 #define M       16
 #define NCOL    256
 #define THREADS 256
 #define RUNS    200
 
-// mapping 0: s is slowest  -> grid(NCOL, M, S), contributions to one element are M*NCOL apart
-// mapping 1: s is fastest  -> grid(S, NCOL, M), contributions to one element are adjacent
-__global__ void splitk_map(float *C, const float *A, const float *B,
-                           int K, int splits, int mapping,
-                           int *elemCtr, int *arrival) {
+// mapping 0: s slowest -> grid(NCOL, M, S), contributions to one element M*NCOL apart
+// mapping 1: s fastest -> grid(S, NCOL, M), contributions to one element adjacent
+__global__ void splitk_probe(float *C, const float *A, const float *B,
+                             int K, int splits, int mapping,
+                             float *oldv, float *part) {
     int m, n, s;
     if (mapping == 0) { n = blockIdx.x; m = blockIdx.y; s = blockIdx.z; }
     else              { s = blockIdx.x; n = blockIdx.y; m = blockIdx.z; }
@@ -37,9 +39,9 @@ __global__ void splitk_map(float *C, const float *A, const float *B,
     }
     if (threadIdx.x == 0) {
         int elem = m * NCOL + n;
-        atomicAdd(&C[elem], sm[0]);
-        int pos = atomicAdd(&elemCtr[elem], 1);      // per-element arrival slot
-        arrival[(size_t)elem * splits + pos] = s;
+        float before = atomicAdd(&C[elem], sm[0]);   // the real atomic, its own return
+        oldv[(size_t)elem * splits + s] = before;
+        part[(size_t)elem * splits + s] = sm[0];
     }
 }
 
@@ -54,15 +56,17 @@ static int ulps(float a, float b) {
 
 int main() {
     cudaDeviceProp p;
-    cudaGetDeviceProperties(&p, 0);
+    CK(cudaGetDeviceProperties(&p, 0));
     printf("%s (sm_%d%d)\n", p.name, p.major, p.minor);
-    printf("Same math, same split count. Only the block->element mapping changes.\n");
-    printf("s slowest = contributions to one output are M*NCOL blocks apart.\n");
-    printf("s fastest = contributions to one output are adjacent.\n");
-    printf("in-order = %% of elements whose S partials arrived as s=0,1,2,...\n");
-    printf("ord chg  = %% of elements whose arrival order differed from run 0\n");
-    printf("           at least once. THIS is the per-element measurement;\n");
-    printf("           global block order does not answer this question.\n\n");
+    printf("Same arithmetic, same split count. Only the block->element mapping differs.\n");
+    printf("s slowest = the S partials for one output are M*NCOL blocks apart.\n");
+    printf("s fastest = the S partials for one output are adjacent.\n\n");
+    printf("Order is reconstructed from the output atomicAdd's own return value,\n");
+    printf("not from a separate counter, so it is the order that actually produced C.\n");
+    printf("  in-order = %% of elements accumulated as s=0,1,2,...\n");
+    printf("  ord chg  = %% of elements whose order differed from run 0 at least once\n");
+    printf("  ambig    = %% of (element,run) pairs where order was not recoverable\n");
+    printf("Inputs are synthetic heavy-tailed values, not data from a real model.\n\n");
 
     const int K = 65536;
     int Sv[] = {2, 4, 8, 32};
@@ -79,71 +83,71 @@ int main() {
     };
     gen(hA); gen(hB);
 
-    float *dA, *dB, *dC; int *dCtr, *dArr;
+    float *dA, *dB, *dC, *dOld, *dPart;
     CK(cudaMalloc(&dA, hA.size() * 4));
     CK(cudaMalloc(&dB, hB.size() * 4));
     CK(cudaMalloc(&dC, outN * 4));
-    CK(cudaMalloc(&dCtr, outN * sizeof(int)));
-    CK(cudaMalloc(&dArr, outN * 32 * sizeof(int)));
-    cudaMemcpy(dA, hA.data(), hA.size() * 4, cudaMemcpyHostToDevice);
-    cudaMemcpy(dB, hB.data(), hB.size() * 4, cudaMemcpyHostToDevice);
+    CK(cudaMalloc(&dOld,  outN * 32 * 4));
+    CK(cudaMalloc(&dPart, outN * 32 * 4));
+    CK(cudaMemcpy(dA, hA.data(), hA.size() * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dB, hB.data(), hB.size() * 4, cudaMemcpyHostToDevice));
 
-    printf("%10s %7s %10s %10s %12s %10s %11s\n",
-           "mapping", "splits", "in-order", "ord chg", "elems dif", "max ulp", "max rel");
+    printf("%10s %7s %10s %10s %8s %12s %10s %11s\n",
+           "mapping", "splits", "in-order", "ord chg", "ambig",
+           "elems dif", "max ulp", "max rel");
 
     for (int mapping = 0; mapping < 2; mapping++) {
         for (int si = 0; si < 4; si++) {
             int S = Sv[si];
             std::vector<float> ref(outN), cur(outN);
-            std::vector<int> arr((size_t)outN * S), arrRef((size_t)outN * S);
+            std::vector<float> hOld((size_t)outN * S), hPart((size_t)outN * S);
+            std::vector<std::vector<int>> ordRef(outN);
             std::vector<char> touched(outN, 0), ordChanged(outN, 0);
-            std::vector<int> allUlp;
-            double inOrderPct = 0, maxRel = 0;
+            std::vector<int> ord;
+            size_t ambig = 0, canonical = 0, ordSamples = 0;
+            int maxUlp = 0; double maxRel = 0;
 
             for (int r = 0; r < RUNS; r++) {
-                cudaMemset(dC, 0, outN * 4);
-                cudaMemset(dCtr, 0, outN * sizeof(int));
+                CK(cudaMemset(dC, 0, outN * 4));
                 dim3 grid = mapping == 0 ? dim3(NCOL, M, S) : dim3(S, NCOL, M);
-                splitk_map<<<grid, THREADS>>>(dC, dA, dB, K, S, mapping, dCtr, dArr);
+                splitk_probe<<<grid, THREADS>>>(dC, dA, dB, K, S, mapping, dOld, dPart);
                 CKLAUNCH();
                 CK(cudaMemcpy(cur.data(), dC, outN * 4, cudaMemcpyDeviceToHost));
-                CK(cudaMemcpy(arr.data(), dArr, (size_t)outN * S * sizeof(int),
-                              cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(hOld.data(), dOld, (size_t)outN * S * 4, cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(hPart.data(), dPart, (size_t)outN * S * 4, cudaMemcpyDeviceToHost));
 
-                size_t ordered = 0;
                 for (size_t e = 0; e < outN; e++) {
-                    bool ok = true;
-                    for (int i = 0; i < S; i++)
-                        if (arr[e * S + i] != i) { ok = false; break; }
-                    ordered += ok;
+                    ordSamples++;
+                    if (!reconstruct_order(&hOld[e * S], &hPart[e * S], S, ord)) {
+                        ambig++;
+                        continue;
+                    }
+                    bool canon = true;
+                    for (int i = 0; i < S; i++) if (ord[i] != i) { canon = false; break; }
+                    canonical += canon;
+                    if (r == 0) ordRef[e] = ord;
+                    else if (!ordRef[e].empty() && ord != ordRef[e]) ordChanged[e] = 1;
                 }
-                inOrderPct += 100.0 * ordered / outN;
 
-                if (r == 0) { ref = cur; arrRef = arr; continue; }
-                for (size_t e = 0; e < outN; e++)
-                    for (int i = 0; i < S; i++)
-                        if (arr[e * S + i] != arrRef[e * S + i]) { ordChanged[e] = 1; break; }
+                if (r == 0) { ref = cur; continue; }
                 for (size_t i = 0; i < outN; i++) {
                     if (cur[i] == ref[i]) continue;
                     touched[i] = 1;
-                    allUlp.push_back(ulps(cur[i], ref[i]));
+                    maxUlp = std::max(maxUlp, ulps(cur[i], ref[i]));
                     double ae = fabs((double)cur[i] - (double)ref[i]);
                     if (ref[i] != 0.f) maxRel = std::max(maxRel, ae / fabs((double)ref[i]));
                 }
             }
             size_t everDiff = 0, nOrd = 0;
             for (size_t i = 0; i < outN; i++) { everDiff += touched[i]; nOrd += ordChanged[i]; }
-            int mx = 0;
-            if (!allUlp.empty()) {
-                std::sort(allUlp.begin(), allUlp.end());
-                mx = allUlp.back();
-            }
-            printf("%10s %7d %9.2f%% %9.2f%% %6zu/%-5zu %10d %11.3e\n",
+            printf("%10s %7d %9.2f%% %9.2f%% %7.3f%% %6zu/%-5zu %10d %11.3e\n",
                    mapping == 0 ? "s slowest" : "s fastest", S,
-                   inOrderPct / RUNS, 100.0 * nOrd / outN, everDiff, outN, mx, maxRel);
+                   100.0 * canonical / ordSamples, 100.0 * nOrd / outN,
+                   100.0 * ambig / ordSamples, everDiff, outN, maxUlp, maxRel);
         }
         printf("\n");
     }
-    cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dCtr); cudaFree(dArr);
+    CK(cudaFree(dA)); CK(cudaFree(dB)); CK(cudaFree(dC));
+    CK(cudaFree(dOld)); CK(cudaFree(dPart));
     return 0;
 }

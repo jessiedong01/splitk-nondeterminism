@@ -7,6 +7,7 @@
 #include <vector>
 #include <algorithm>
 #include "check.cuh"
+#include "order_probe.cuh"
 
 #define M       16
 #define NCOL    256
@@ -14,7 +15,7 @@
 #define RUNS    300
 
 __global__ void splitk(float *C, const float *A, const float *B,
-                       int K, int splits, int *elemCtr, int *arrival) {
+                       int K, int splits, float *oldv, float *part) {
     int n = blockIdx.x, m = blockIdx.y, s = blockIdx.z;
     int kb = (K + splits - 1) / splits;
     int k0 = s * kb, k1 = min(k0 + kb, K);
@@ -30,9 +31,9 @@ __global__ void splitk(float *C, const float *A, const float *B,
     }
     if (threadIdx.x == 0) {
         int elem = m * NCOL + n;
-        atomicAdd(&C[elem], sm[0]);
-        int pos = atomicAdd(&elemCtr[elem], 1);
-        arrival[(size_t)elem * splits + pos] = s;
+        float before = atomicAdd(&C[elem], sm[0]);   // real atomic, its own return
+        oldv[(size_t)elem * splits + s] = before;
+        part[(size_t)elem * splits + s] = sm[0];
     }
 }
 
@@ -59,8 +60,10 @@ int main() {
     CK(cudaGetDeviceProperties(&p, 0));
     printf("%s (sm_%d%d), %d SMs\n", p.name, p.major, p.minor, p.multiProcessorCount);
     printf("Same measurement on an idle GPU and with a background kernel resident.\n");
-    printf("ord chg = %% of output elements whose partial-sum arrival order\n");
-    printf("          differed from run 0 at least once.\n\n");
+    printf("Order is reconstructed from the output atomicAdd's own return value.\n");
+    printf("ord chg = %% of elements whose accumulation order differed from run 0.\n");
+    printf("ambig   = %% of (element,run) pairs where order was not recoverable.\n");
+    printf("Inputs are synthetic heavy-tailed values, not data from a real model.\n\n");
 
     const int K = 65536;
     int Sv[] = {2, 4, 8, 32};
@@ -77,13 +80,13 @@ int main() {
     };
     gen(hA); gen(hB);
 
-    float *dA, *dB, *dC, *dSink; int *dCtr, *dArr;
+    float *dA, *dB, *dC, *dSink, *dOld, *dPart;
     CK(cudaMalloc(&dA, hA.size() * 4));
     CK(cudaMalloc(&dB, hB.size() * 4));
     CK(cudaMalloc(&dC, outN * 4));
     CK(cudaMalloc(&dSink, 4));
-    CK(cudaMalloc(&dCtr, outN * sizeof(int)));
-    CK(cudaMalloc(&dArr, outN * 32 * sizeof(int)));
+    CK(cudaMalloc(&dOld,  outN * 32 * 4));
+    CK(cudaMalloc(&dPart, outN * 32 * 4));
     CK(cudaMemcpy(dA, hA.data(), hA.size() * 4, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dB, hB.data(), hB.size() * 4, cudaMemcpyHostToDevice));
 
@@ -102,32 +105,41 @@ int main() {
         }
         printf("--- %s ---\n", contended ? "CONTENDED (background kernel resident)"
                                          : "IDLE");
-        printf("%7s %10s %12s %10s %12s %12s\n",
-               "splits", "ord chg", "elems dif", "max ulp", "max abs", "max rel");
+        printf("%7s %10s %8s %12s %10s %12s %12s\n",
+               "splits", "ord chg", "ambig", "elems dif", "max ulp", "max abs", "max rel");
 
         for (int si = 0; si < 4; si++) {
             int S = Sv[si];
             std::vector<float> ref(outN), cur(outN);
-            std::vector<int> arrRef((size_t)outN * S), arr((size_t)outN * S);
+            std::vector<float> hOld((size_t)outN * S), hPart((size_t)outN * S);
+            std::vector<std::vector<int>> ordRef(outN);
             std::vector<char> touched(outN, 0), ordChanged(outN, 0);
+            std::vector<int> ord;
+            size_t ambig = 0, ordSamples = 0;
             int maxUlp = 0; double maxAbs = 0, maxRel = 0;
 
             for (int r = 0; r < RUNS; r++) {
                 CK(cudaMemsetAsync(dC, 0, outN * 4, workStream));
-                CK(cudaMemsetAsync(dCtr, 0, outN * sizeof(int), workStream));
                 splitk<<<dim3(NCOL, M, S), THREADS, 0, workStream>>>(
-                    dC, dA, dB, K, S, dCtr, dArr);
+                    dC, dA, dB, K, S, dOld, dPart);
                 CK(cudaGetLastError());
                 CK(cudaMemcpyAsync(cur.data(), dC, outN * 4,
                                    cudaMemcpyDeviceToHost, workStream));
-                CK(cudaMemcpyAsync(arr.data(), dArr, (size_t)outN * S * sizeof(int),
+                CK(cudaMemcpyAsync(hOld.data(), dOld, (size_t)outN * S * 4,
+                                   cudaMemcpyDeviceToHost, workStream));
+                CK(cudaMemcpyAsync(hPart.data(), dPart, (size_t)outN * S * 4,
                                    cudaMemcpyDeviceToHost, workStream));
                 CK(cudaStreamSynchronize(workStream));
 
-                if (r == 0) { ref = cur; arrRef = arr; continue; }
                 for (size_t e = 0; e < outN; e++) {
-                    for (int i = 0; i < S; i++)
-                        if (arr[e * S + i] != arrRef[e * S + i]) { ordChanged[e] = 1; break; }
+                    ordSamples++;
+                    if (!reconstruct_order(&hOld[e * S], &hPart[e * S], S, ord)) { ambig++; continue; }
+                    if (r == 0) ordRef[e] = ord;
+                    else if (!ordRef[e].empty() && ord != ordRef[e]) ordChanged[e] = 1;
+                }
+
+                if (r == 0) { ref = cur; continue; }
+                for (size_t e = 0; e < outN; e++) {
                     if (cur[e] == ref[e]) continue;
                     touched[e] = 1;
                     maxUlp = std::max(maxUlp, ulps(cur[e], ref[e]));
@@ -138,8 +150,9 @@ int main() {
             }
             size_t nd = 0, nord = 0;
             for (size_t e = 0; e < outN; e++) { nd += touched[e]; nord += ordChanged[e]; }
-            printf("%7d %9.2f%% %6zu/%-5zu %10d %12.3e %12.3e\n",
-                   S, 100.0 * nord / outN, nd, outN, maxUlp, maxAbs, maxRel);
+            printf("%7d %9.2f%% %7.3f%% %6zu/%-5zu %10d %12.3e %12.3e\n",
+                   S, 100.0 * nord / outN, 100.0 * ambig / ordSamples,
+                   nd, outN, maxUlp, maxAbs, maxRel);
         }
         if (contended) {
             *hStop = 1;
