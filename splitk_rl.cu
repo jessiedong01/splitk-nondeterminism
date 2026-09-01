@@ -3,6 +3,7 @@
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include "check.cuh"
 
 #define ROWS    8
 #define VOCAB   256
@@ -42,7 +43,7 @@ static void all_lp(const std::vector<float> &lg, std::vector<double> &lp) {
 
 int main() {
     cudaDeviceProp p;
-    cudaGetDeviceProperties(&p, 0);
+    CK(cudaGetDeviceProperties(&p, 0));
     printf("%s (sm_%d%d)\n", p.name, p.major, p.minor);
     printf("logits[%d,%d] = hidden[%d,K] x lm_head[K,%d], %d runs per config\n\n",
            ROWS, VOCAB, ROWS, VOCAB, RUNS);
@@ -53,6 +54,12 @@ int main() {
     printf("flips   = tokens whose PPO clip status changed, out of %d.\n", NTOK);
     printf("          Ratios are pre-seeded across [0.75,1.25] so the 0.8/1.2\n");
     printf("          boundaries are populated. Without this the test is vacuous.\n");
+    printf("at-risk = tokens sitting within the measured perturbation of a\n");
+    printf("          boundary. A token can only flip if it is this close.\n");
+    printf("          Expect 0 flips; the honest statement is the WINDOW, not\n");
+    printf("          the flip count -- with %d samples over a 0.5-wide range the\n", NTOK);
+    printf("          gap between adjacent ratios is ~%.1e, far above the noise.\n",
+           0.50 / (NTOK - 1));
 
     int Ks[] = {4096, 16384};
     int Sv[] = {2, 4, 8, 16, 32};
@@ -76,25 +83,27 @@ int main() {
         gen(hA); gen(hB);
 
         float *dA, *dB, *dC;
-        cudaMalloc(&dA, hA.size() * 4);
-        cudaMalloc(&dB, hB.size() * 4);
-        cudaMalloc(&dC, outN * 4);
-        cudaMemcpy(dA, hA.data(), hA.size() * 4, cudaMemcpyHostToDevice);
-        cudaMemcpy(dB, hB.data(), hB.size() * 4, cudaMemcpyHostToDevice);
+        CK(cudaMalloc(&dA, hA.size() * 4));
+        CK(cudaMalloc(&dB, hB.size() * 4));
+        CK(cudaMalloc(&dC, outN * 4));
+        CK(cudaMemcpy(dA, hA.data(), hA.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dB, hB.data(), hB.size() * 4, cudaMemcpyHostToDevice));
 
         auto launch = [&](int S, std::vector<float> &out) {
             out.resize(outN);
-            cudaMemset(dC, 0, outN * 4);
+            CK(cudaMemset(dC, 0, outN * 4));
             splitk<<<dim3(VOCAB, ROWS, S), THREADS>>>(dC, dA, dB, K, S);
-            cudaMemcpy(out.data(), dC, outN * 4, cudaMemcpyDeviceToHost);
+            CKLAUNCH();
+            CK(cudaMemcpy(out.data(), dC, outN * 4, cudaMemcpyDeviceToHost));
         };
 
         std::vector<float> lg1; launch(1, lg1);
         std::vector<double> lp1; all_lp(lg1, lp1);
 
         printf("\nK = %d\n", K);
-        printf("%7s %13s %13s %13s %13s %8s\n",
-               "splits", "NONDET dlp", "NONDET |r-1|", "ALGO dlp", "ALGO |r-1|", "flips");
+        printf("%7s %13s %13s %13s %13s %7s %8s\n",
+               "splits", "NONDET dlp", "NONDET |r-1|", "ALGO dlp", "ALGO |r-1|",
+               "flips", "at-risk");
 
         for (int si = 0; si < 5; si++) {
             int S = Sv[si];
@@ -119,10 +128,16 @@ int main() {
                     if (c0 != c1) flips++;
                 }
             }
-            printf("%7d %13.3e %13.3e %13.3e %13.3e %8d\n",
-                   S, ndDlp, exp(ndDlp) - 1.0, algDlp, exp(algDlp) - 1.0, flips);
+            double win = exp(ndDlp) - 1.0;     // ratio-space perturbation
+            int atRisk = 0;
+            for (int i = 0; i < NTOK; i++) {
+                double r = ratioTarget[i];
+                if (fabs(r - 0.8) < r * win || fabs(r - 1.2) < r * win) atRisk++;
+            }
+            printf("%7d %13.3e %13.3e %13.3e %13.3e %7d %8d\n",
+                   S, ndDlp, win, algDlp, exp(algDlp) - 1.0, flips, atRisk);
         }
-        cudaFree(dA); cudaFree(dB); cudaFree(dC);
+        CK(cudaFree(dA)); CK(cudaFree(dB)); CK(cudaFree(dC));
     }
     return 0;
 }

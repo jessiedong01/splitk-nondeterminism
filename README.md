@@ -50,3 +50,33 @@ nvcc -O3 -arch=sm_100 splitk_rl.cu     -o splitk_rl
 `splits = 1` is the control. Each block owns a distinct output element, so no
 two blocks accumulate into the same address and the result must be bit-exact.
 If a `splits = 1` row shows any variation, the harness is broken.
+
+## Running everything
+
+```
+./run_all.sh sm_100        # sm_90 for H100, sm_89 for 4090
+```
+
+Builds all six programs first and stops on the first compile error, so a typo
+costs a minute rather than a session. Every kernel launch is followed by
+`cudaGetLastError` + `cudaDeviceSynchronize`, because a launch that silently
+fails produces a table of perfect zeros that looks like a finding.
+
+Output lands in `b200-final-results.txt` with the commit hash, driver version
+and device string at the top.
+
+## What each program answers
+
+- `splitk_order` — global block arrival order. Weak evidence on its own: a
+  scrambled global order does **not** show that the partials for one output
+  element swapped places.
+- `splitk_layout` — the real per-element measurement. Records the arrival order
+  of the S partials belonging to each individual output, under two block
+  mappings (`s` slowest vs `s` fastest), and reports how often that order
+  changed across runs.
+- `splitk_bench` — run-to-run differences: frequency, ULP, absolute, relative.
+- `splitk_rl` — NONDET vs ALGO, plus a synthetic clip-boundary test.
+- `splitk_contend` — the same measurement idle and with a background kernel
+  resident. Scheduling pressure is the most likely way to expose variation.
+- `splitk_timing` — atomic split-K vs fixed-order split-K vs no split-K, so the
+  cost of determinism is a number rather than a guess.

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include "check.cuh"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
@@ -78,11 +79,11 @@ static void sweep(const char *name, bool heavy) {
         for (size_t i = 0; i < hB.size(); i++) tB[i] = (T)hB[i];
 
         T *dA, *dB; float *dC;
-        cudaMalloc(&dA, tA.size() * sizeof(T));
-        cudaMalloc(&dB, tB.size() * sizeof(T));
-        cudaMalloc(&dC, outN * 4);
-        cudaMemcpy(dA, tA.data(), tA.size() * sizeof(T), cudaMemcpyHostToDevice);
-        cudaMemcpy(dB, tB.data(), tB.size() * sizeof(T), cudaMemcpyHostToDevice);
+        CK(cudaMalloc(&dA, tA.size() * sizeof(T)));
+        CK(cudaMalloc(&dB, tB.size() * sizeof(T)));
+        CK(cudaMalloc(&dC, outN * 4));
+        CK(cudaMemcpy(dA, tA.data(), tA.size() * sizeof(T), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dB, tB.data(), tB.size() * sizeof(T), cudaMemcpyHostToDevice));
 
         for (int si = 0; si < 6; si++) {
             int S = Sv[si];
@@ -95,9 +96,10 @@ static void sweep(const char *name, bool heavy) {
             std::vector<char> touched(outN, 0);
 
             for (int r = 0; r < RUNS; r++) {
-                cudaMemset(dC, 0, outN * 4);
+                CK(cudaMemset(dC, 0, outN * 4));
                 splitk<T><<<dim3(NCOL, M, S), THREADS>>>(dC, dA, dB, K, S);
-                cudaMemcpy(cur.data(), dC, outN * 4, cudaMemcpyDeviceToHost);
+                CKLAUNCH();
+                CK(cudaMemcpy(cur.data(), dC, outN * 4, cudaMemcpyDeviceToHost));
 
                 if (r == 0) {
                     ref = cur;
@@ -144,7 +146,7 @@ static void sweep(const char *name, bool heavy) {
 
 int main() {
     cudaDeviceProp p;
-    cudaGetDeviceProperties(&p, 0);
+    CK(cudaGetDeviceProperties(&p, 0));
     printf("%s (sm_%d%d)\n", p.name, p.major, p.minor);
     printf("C[%d,%d] = A[%d,K] x B[K,%d], %d runs per config, identical inputs\n", M, NCOL, M, NCOL, RUNS);
     printf("elems dif = output elements that ever differed from run 0\n");

@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <vector>
 #include <algorithm>
+#include "check.cuh"
 
 #define M       16
 #define NCOL    256
@@ -36,7 +37,7 @@ __global__ void probe(float *C, const float *A, const float *B,
 
 int main() {
     cudaDeviceProp p;
-    cudaGetDeviceProperties(&p, 0);
+    CK(cudaGetDeviceProperties(&p, 0));
     printf("%s (sm_%d%d)\n", p.name, p.major, p.minor);
     printf("Do the split-K atomics actually arrive in a different order each run?\n");
     printf("%d runs per config. Ticket order recorded via a global atomic counter.\n\n", RUNS);
@@ -55,11 +56,11 @@ int main() {
         for (auto &v : hB) v = (float)rand() / RAND_MAX - 0.5f;
 
         float *dA, *dB, *dC;
-        cudaMalloc(&dA, hA.size() * 4);
-        cudaMalloc(&dB, hB.size() * 4);
-        cudaMalloc(&dC, outN * 4);
-        cudaMemcpy(dA, hA.data(), hA.size() * 4, cudaMemcpyHostToDevice);
-        cudaMemcpy(dB, hB.data(), hB.size() * 4, cudaMemcpyHostToDevice);
+        CK(cudaMalloc(&dA, hA.size() * 4));
+        CK(cudaMalloc(&dB, hB.size() * 4));
+        CK(cudaMalloc(&dC, outN * 4));
+        CK(cudaMemcpy(dA, hA.data(), hA.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dB, hB.data(), hB.size() * 4, cudaMemcpyHostToDevice));
 
         for (int si = 0; si < 6; si++) {
             int S = Sv[si];
@@ -70,10 +71,11 @@ int main() {
 
             for (int r = 0; r < RUNS; r++) {
                 int zero = 0;
-                cudaMemcpyToSymbol(g_slot, &zero, sizeof(int));
-                cudaMemset(dC, 0, outN * 4);
+                CK(cudaMemcpyToSymbol(g_slot, &zero, sizeof(int)));
+                CK(cudaMemset(dC, 0, outN * 4));
                 probe<<<dim3(NCOL, M, S), THREADS>>>(dC, dA, dB, K, S, dOrd);
-                cudaMemcpy(cur.data(), dOrd, nblk * sizeof(int), cudaMemcpyDeviceToHost);
+                CKLAUNCH();
+                CK(cudaMemcpy(cur.data(), dOrd, nblk * sizeof(int), cudaMemcpyDeviceToHost));
                 if (r == 0) { ref = cur; continue; }
                 size_t same = 0;
                 for (size_t i = 0; i < nblk; i++) same += (cur[i] == ref[i]);
@@ -82,7 +84,7 @@ int main() {
             }
             printf("%8d %7d %8zu %11d/%-3d %13.2f%%\n",
                    K, S, nblk, identical, RUNS - 1, 100.0 * posMatch / (RUNS - 1));
-            cudaFree(dOrd);
+            CK(cudaFree(dOrd));
         }
         printf("\n");
         cudaFree(dA); cudaFree(dB); cudaFree(dC);
