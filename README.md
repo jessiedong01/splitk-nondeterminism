@@ -1,58 +1,52 @@
-# How nondeterministic is split-K, actually?
+# split-K nondeterminism
 
-"Split-K GEMMs are nondeterministic" is repeated constantly and rarely quantified.
-This measures the magnitude, and what makes it larger.
+Does split-K GEMM with `atomicAdd` accumulation actually produce different
+results run to run, and does it matter for RL?
 
-## Why it happens
+## Scope, read this first
 
-When K is large but M and N are small, one thread block per output tile does not fill
-the GPU. Split-K divides the K dimension across blocks, each computes a partial sum, and
-the partials are combined with `atomicAdd`. Floating-point addition is not associative,
-so the order the partials land in changes the result in the low bits. That order depends
-on which block finishes first, which varies between runs.
+These are **custom microbenchmark kernels**, not production GEMMs. One output
+element per block, ordinary scalar FMA, a shared-memory tree reduction, and a
+single `atomicAdd` per block. No tiling, no tensor cores, no `tcgen05`, no
+CUTLASS, no cuBLAS.
 
-## Method
+Any result here describes **this kernel on this GPU while it is otherwise idle**.
+It does not establish how cuBLAS or CUTLASS split-K behave. Their block layouts,
+tile sizes, occupancy, and reduction strategies are different, and this
+experiment suggests those are exactly the things that decide the answer.
 
-`C[8,128] = A[8,K] x B[K,128]` in fp32. Identical inputs every time, so any difference
-between runs is nondeterminism rather than a different problem.
+## Programs
 
-Each configuration runs 50 times. Run 0 is the reference; the other 49 are compared
-against it. Reported per configuration:
+| file | question |
+|---|---|
+| `splitk_bench.cu` | Does the output change across runs? ULP, absolute and relative error. |
+| `splitk_order.cu` | Do the blocks actually arrive in a different order each run? |
+| `splitk_layout.cu` | Does the block-to-element mapping change the answer? |
+| `splitk_rl.cu` | Logprob and PPO effects, run-to-run vs reduction-method. |
 
-- how many runs differed from the reference at all
-- the largest gap in **ULPs**, the number of representable floats between two values
-- the largest relative difference
+## Two different quantities
 
-Sweeps K over 1024, 4096, 16384, 65536 and the split factor over 1, 2, 4, 8, 16, 32.
+`splitk_rl` reports both, because they are easy to confuse:
 
-The reduction inside each block is a deterministic tree, so the only source of variation
-is the ordering of the `splits` atomic adds.
+- **NONDET** — atomic run 0 vs atomic runs 1..N at the *same* split factor.
+  This is run-to-run nondeterminism.
+- **ALGO** — split=1 vs atomic split-K. This is the difference between two
+  reduction algorithms. It shows up when generation and training use different
+  kernels. It is deterministic and it is not nondeterminism.
 
-**Split factor 1 is the control.** One block per output element, no cross-block atomics,
-so it must be bit-identical on every run. If it is not, the harness is wrong and nothing
-else in the table means anything.
+The PPO clip test seeds old-policy logprobs so ratios span [0.75, 1.25]. Starting
+every ratio at exactly 1.0 and asking whether numerical noise pushes it past
+0.8 or 1.2 is a rigged question with a guaranteed answer.
 
-## Build and run
+## Build
 
-```bash
-nvcc -O3 -arch=sm_90 splitk_bench.cu -o splitk_bench
-./splitk_bench
+```
+nvcc -O3 -arch=sm_100 splitk_bench.cu  -o splitk_bench     # sm_90 for H100
+nvcc -O3 -arch=sm_100 splitk_order.cu  -o splitk_order
+nvcc -O3 -arch=sm_100 splitk_layout.cu -o splitk_layout
+nvcc -O3 -arch=sm_100 splitk_rl.cu     -o splitk_rl
 ```
 
-Set `-arch` to match the card: `sm_80` A100, `sm_89` RTX 4090, `sm_90` H100, `sm_100` B200.
-
-## Hypothesis, recorded before running
-
-Split factor 1 is bit-exact. Variation appears from split factor 2 upward and grows with
-both the split factor and K, since both increase the number of partial sums whose ordering
-can change.
-
-## Results
-
-Not yet run.
-
-## What this cannot show
-
-Whether the differences change downstream outcomes in RL or other logprob-sensitive
-training. That needs a training run, not a microbenchmark. What the numbers do give is a
-noise floor to compare against the gaps that actually matter in those settings.
+`splits = 1` is the control. Each block owns a distinct output element, so no
+two blocks accumulate into the same address and the result must be bit-exact.
+If a `splits = 1` row shows any variation, the harness is broken.

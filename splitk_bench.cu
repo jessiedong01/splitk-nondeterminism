@@ -57,9 +57,9 @@ static void sweep(const char *name, bool heavy) {
     size_t outN = (size_t)M * NCOL;
 
     printf("\n=== %s inputs, fp32 accumulate, %s data ===\n", name, heavy ? "heavy-tailed" : "benign");
-    printf("%8s %7s %9s %8s %8s %8s %8s %8s %9s\n",
+    printf("%8s %7s %9s %8s %8s %8s %10s %10s %9s\n",
            "K", "splits", "elems dif", "p50 ulp", "p99 ulp", "max ulp",
-           "surv f16", "surv bf16", "argmax");
+           "max abs", "max rel", "argmax");
 
     for (int ki = 0; ki < 4; ki++) {
         int K = Ks[ki];
@@ -90,6 +90,7 @@ static void sweep(const char *name, bool heavy) {
             std::vector<int> refArg(M);
             std::vector<int> allUlp;
             size_t everDiff = 0, survF16 = 0, survBF16 = 0;
+            double maxAbs = 0, maxRel = 0;
             int argFlips = 0;
             std::vector<char> touched(outN, 0);
 
@@ -109,6 +110,10 @@ static void sweep(const char *name, bool heavy) {
                     if (cur[i] == ref[i]) continue;
                     touched[i] = 1;
                     allUlp.push_back(ulps(cur[i], ref[i]));
+                    double ae = fabs((double)cur[i] - (double)ref[i]);
+                    double den = fabs((double)ref[i]);
+                    maxAbs = std::max(maxAbs, ae);
+                    if (den > 0) maxRel = std::max(maxRel, ae / den);
                     if (to_fp16(cur[i]) != to_fp16(ref[i])) survF16++;
                     if (to_bf16(cur[i]) != to_bf16(ref[i])) survBF16++;
                 }
@@ -128,11 +133,10 @@ static void sweep(const char *name, bool heavy) {
                 mx  = allUlp.back();
             }
             double totalDiff = (double)allUlp.size();
-            printf("%8d %7d %6zu/%-3zu %8d %8d %8d %7.1f%% %8.1f%% %6d/%-3d\n",
+            (void)survF16; (void)survBF16; (void)totalDiff;
+            printf("%8d %7d %6zu/%-4zu %8d %8d %8d %10.2e %10.2e %6d/%-4d\n",
                    K, S, everDiff, outN, p50, p99, mx,
-                   totalDiff ? 100.0 * survF16 / totalDiff : 0.0,
-                   totalDiff ? 100.0 * survBF16 / totalDiff : 0.0,
-                   argFlips, (RUNS - 1) * M);
+                   maxAbs, maxRel, argFlips, (RUNS - 1) * M);
         }
         cudaFree(dA); cudaFree(dB); cudaFree(dC);
     }
