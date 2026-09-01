@@ -67,16 +67,28 @@ and device string at the top.
 
 ## What each program answers
 
-- `splitk_order` — global block arrival order. Weak evidence on its own: a
-  scrambled global order does **not** show that the partials for one output
-  element swapped places.
-- `splitk_layout` — the real per-element measurement. Records the arrival order
-  of the S partials belonging to each individual output, under two block
-  mappings (`s` slowest vs `s` fastest), and reports how often that order
-  changed across runs.
+- `splitk_order` — global block arrival order, via a counter. Kept for context
+  only. Weak on its own: a scrambled global order does **not** show that the
+  partials for one output element swapped places, and a counter is a second
+  independent atomic, so a block can win the output `atomicAdd` and lose the
+  counter race. That records an order which never happened.
+- `splitk_layout` — the real per-element measurement, and the exact one. The
+  probe uses the **return value of the output `atomicAdd`**: the accumulator
+  value immediately before each split was added. Since `C` starts at zero, the
+  split that saw `old == 0` went first, the one that saw `old == p_first` went
+  second, and walking that chain recovers the true accumulation order. Runs
+  under two block mappings (`s` slowest vs `s` fastest) and reports how often
+  the order changed across runs, plus an `ambig` rate for the rare cases where
+  two orders produce identical intermediates. Instrumented kernels are used
+  only for order study; `splitk_bench` stays uninstrumented.
 - `splitk_bench` — run-to-run differences: frequency, ULP, absolute, relative.
-- `splitk_rl` — NONDET vs ALGO, plus a synthetic clip-boundary test.
+- `splitk_rl` — NONDET vs ALGO, plus a synthetic clip-boundary test. Flip
+  counts are reported both as events out of `(runs-1) x tokens` and as distinct
+  tokens out of `tokens`. The headline is the perturbation window, not the flip
+  count: the seeded ratio grid is far coarser than the noise, so zero flips is
+  expected and says little.
 - `splitk_contend` — the same measurement idle and with a background kernel
   resident. Scheduling pressure is the most likely way to expose variation.
-- `splitk_timing` — atomic split-K vs fixed-order split-K vs no split-K, so the
-  cost of determinism is a number rather than a guess.
+- `splitk_timing` — atomic split-K vs fixed-order split-K vs no split-K. This
+  is the cost of determinism **in this scalar microbenchmark**, not the general
+  cost of a deterministic GEMM.
