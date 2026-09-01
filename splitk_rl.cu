@@ -8,7 +8,7 @@
 #define ROWS    8
 #define VOCAB   256
 #define THREADS 256
-#define RUNS    200
+#define RUNS    500
 
 __global__ void splitk(float *C, const float *A, const float *B, int K, int splits) {
     int n = blockIdx.x, m = blockIdx.y, s = blockIdx.z;
@@ -62,8 +62,14 @@ int main() {
         int K = Ks[ki];
         std::vector<float> hA((size_t)ROWS * K), hB((size_t)K * VOCAB);
         srand(7);
-        for (auto &v : hA) v = ((float)rand() / RAND_MAX - 0.5f) * 0.05f;
-        for (auto &v : hB) v = ((float)rand() / RAND_MAX - 0.5f) * 0.05f;
+        auto gen = [&](std::vector<float> &v) {
+            for (auto &x : v) {
+                double u = (double)rand() / RAND_MAX;
+                double n = ((double)rand() / RAND_MAX - 0.5) * 2.0;
+                x = (float)(u < 0.01 ? n * 2.0 : n * 0.02);
+            }
+        };
+        gen(hA); gen(hB);
 
         float *dA, *dB, *dC;
         cudaMalloc(&dA, hA.size() * 4); cudaMalloc(&dB, hB.size() * 4); cudaMalloc(&dC, outN * 4);

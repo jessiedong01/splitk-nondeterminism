@@ -8,10 +8,10 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
-#define M       8
-#define NCOL    128
+#define M       16
+#define NCOL    256
 #define THREADS 256
-#define RUNS    50
+#define RUNS    500
 
 template <typename T>
 __device__ float toF(T v);
@@ -51,12 +51,12 @@ static float to_fp16(float f) { return __half2float(__float2half(f)); }
 static float to_bf16(float f) { return __bfloat162float(__float2bfloat16(f)); }
 
 template <typename T>
-static void sweep(const char *name, float (*cast)(float)) {
+static void sweep(const char *name, bool heavy) {
     int Ks[] = {1024, 4096, 16384, 65536};
     int Sv[] = {1, 2, 4, 8, 16, 32};
     size_t outN = (size_t)M * NCOL;
 
-    printf("\n=== %s inputs, fp32 accumulate ===\n", name);
+    printf("\n=== %s inputs, fp32 accumulate, %s data ===\n", name, heavy ? "heavy-tailed" : "benign");
     printf("%8s %7s %9s %8s %8s %8s %8s %8s %9s\n",
            "K", "splits", "elems dif", "p50 ulp", "p99 ulp", "max ulp",
            "surv f16", "surv bf16", "argmax");
@@ -65,8 +65,14 @@ static void sweep(const char *name, float (*cast)(float)) {
         int K = Ks[ki];
         std::vector<float> hA((size_t)M * K), hB((size_t)K * NCOL);
         srand(1234);
-        for (auto &v : hA) v = (float)rand() / RAND_MAX - 0.5f;
-        for (auto &v : hB) v = (float)rand() / RAND_MAX - 0.5f;
+        auto gen = [&](std::vector<float> &v) {
+            for (auto &x : v) {
+                double u = (double)rand() / RAND_MAX;
+                double n = ((double)rand() / RAND_MAX - 0.5) * 2.0;
+                x = (float)(heavy && u < 0.01 ? n * 20.0 : n * 0.1);
+            }
+        };
+        gen(hA); gen(hB);
         std::vector<T> tA(hA.size()), tB(hB.size());
         for (size_t i = 0; i < hA.size(); i++) tA[i] = (T)hA[i];
         for (size_t i = 0; i < hB.size(); i++) tB[i] = (T)hB[i];
@@ -141,8 +147,9 @@ int main() {
     printf("surv f16/bf16 = share of differences that survive rounding the result to that format\n");
     printf("argmax = row argmax changes, out of (runs-1) x rows\n");
 
-    sweep<float>("fp32", to_fp16);
-    sweep<__half>("fp16", to_fp16);
-    sweep<__nv_bfloat16>("bf16", to_bf16);
+    sweep<float>("fp32", false);
+    sweep<float>("fp32", true);
+    sweep<__half>("fp16", true);
+    sweep<__nv_bfloat16>("bf16", true);
     return 0;
 }
