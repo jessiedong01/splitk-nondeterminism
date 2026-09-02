@@ -1,94 +1,88 @@
 # split-K nondeterminism
 
-Does split-K GEMM with atomicAdd accumulation actually produce a different
-answer run to run, and if it does, is the difference large enough to matter?
+Atomic split-K can give different answers across runs. I wanted to measure when that actually happens and how large the differences are.
 
-## Result
+## result
 
-Nondeterminism in this kernel is decided by the block-to-element grid mapping,
-not by the number of splits. With the split index on the slowest-varying grid
-dimension, the partial sums for a given output arrive in the same order every
-time and the result is bit-identical across 200 runs. Moving the split index to
-the fastest-varying dimension puts those same partial sums next to each other in
-launch order, they race, and the result changes on every run. Same arithmetic,
-same split count, same inputs.
+The block arrangement mattered a lot in this experiment.
 
-| splits | blocks far apart | blocks adjacent | largest relative difference |
+When the blocks for each output were far apart, their partial answers were added in the same order every time. Every output matched across 200 runs.
+
+When those blocks were placed next to each other, they added their answers in different orders. With 32 splits, all 4096 outputs changed at least once.
+
+The calculation, inputs and number of splits stayed the same. Only the block arrangement changed.
+
+| splits | blocks far apart | blocks next to each other | largest difference |
 |---:|---:|---:|---:|
 | 2 | 0 / 4096 | 0 / 4096 | none |
-| 4 | 0 / 4096 | 3015 / 4096 | 5.12e-05 |
-| 8 | 0 / 4096 | 4092 / 4096 | 1.33e-04 |
-| 32 | 0 / 4096 | 4096 / 4096 | 3.08e-04 |
+| 4 | 0 / 4096 | 3015 / 4096 | 0.005% |
+| 8 | 0 / 4096 | 4092 / 4096 | 0.013% |
+| 32 | 0 / 4096 | 4096 / 4096 | 0.031% |
 
-Counts are output elements that changed at least once across 200 runs on one
-B200, with identical inputs every time.
+The counts show how many outputs changed at least once across 200 runs on one B200.
 
-The two-split row is the check that the measurement is honest. The arrival order
-changed for every element and the answer never moved, because two values add to
-the same result in either order. Floating-point addition is commutative; it is
-associativity that fails, and you need at least three terms before order can
-change anything.
+The two-split result is also useful. The order changed, but every output still matched. This is because `a + b` gives the same result as `b + a`. With at least three partial answers, changing the order can also change where rounding happens.
 
-Before any of this was rearranged, the original benchmark ran 96 configurations
-of K, split factor, dtype and input distribution, 500 times each, and produced
-zero differing elements everywhere. That result was not measuring a quiet GPU.
-It was measuring the safe layout.
+## the first test
 
-For reinforcement learning, the harness separates two quantities that are easy
-to confuse. Run-to-run nondeterminism at a fixed split factor was exactly zero.
-The difference between a split=1 reduction and an atomic split-K reduction,
-which is what you see when generation and training use different kernels, was
-9.4e-07 to 1.9e-06 in logprob terms, far below the PPO clipping band.
+Before changing the block arrangement, I tested 96 combinations of:
 
-Fixed-order reduction cost 0 to 2 percent over the atomic version, so determinism
-is close to free here. Split-K itself bought nothing at these shapes, because
-4096 blocks already saturate 148 SMs.
+- K size
+- number of splits
+- fp32, fp16 and bf16 inputs
+- different input values
 
-## Scope
+Each setup was repeated 500 times. Every output matched. Sixteen of the 96 use a single split, where each block owns its own output and nothing can compete, so those cannot vary either way.
 
-These are custom microbenchmark kernels: one output element per block, ordinary
-scalar FMA, a shared-memory tree reduction, one atomicAdd per block. No tiling,
-no tensor cores, no CUTLASS, no cuBLAS. Everything here describes this kernel on
-this GPU while it is otherwise idle, and says nothing about how a production
-GEMM behaves, since tile sizes, occupancy and reduction strategy are exactly the
-things this experiment suggests are decisive.
+This first result did not mean atomic split-K was always repeatable. It meant this particular block arrangement kept adding the partial answers in the same order.
 
-The relative differences come from synthetic heavy-tailed inputs where large
-terms cancel and leave a small result, which is the regime where addition order
-matters most. They are maximums, not typical errors.
+## token probabilities
 
-The contention run tested only weak pressure on the reproducible layout and
-should not be read as evidence that contention has no effect.
+The RL test separates two different kinds of changes:
 
-## Programs
+- running the same atomic split-K kernel again
+- switching between no split-K and split-K
 
-`splitk_layout.cu` is the main experiment. It recovers the true accumulation
-order from the return value of the output atomicAdd, which is the accumulator
-value immediately before each split landed. Since C starts at zero, the split
-that saw zero went first, the one that saw the first partial went second, and
-walking that chain gives the real order. A separate counter cannot do this,
-because it is an independent atomic and a block can win the output atomicAdd and
-lose the counter race.
+Repeating the same layout did not change the log probabilities.
 
-`splitk_bench.cu` measures run-to-run differences in ULPs and absolute and
-relative error. `splitk_rl.cu` reports logprob and PPO effects. `splitk_timing.cu`
-compares atomic, fixed-order and no split-K. `splitk_contend.cu` repeats the
-measurement with a background kernel resident. `splitk_order.cu` records global
-block arrival order and is kept only for context, since a scrambled global order
-does not show that the partials for one output swapped places.
+Switching between no split-K and split-K changed them by around `9.4e-7` to `1.9e-6`. This is a change caused by using different ways to do the calculation, not run-to-run nondeterminism.
 
-## Running it
+## speed
 
+Making the addition order fixed was around 0–2% slower than the atomic version in this test.
+
+Split-K itself did not help much at these matrix sizes. There was already enough work to use the B200, so adding more splits mostly added extra work.
+
+## limits
+
+These are small custom test kernels. Each block calculates one output using regular multiply-add instructions.
+
+They do not use the tiled tensor-core kernels found in cuBLAS or CUTLASS. The results show what happened in this kernel on one otherwise idle B200. They should not be treated as results for every split-K implementation.
+
+The inputs also included some unusually large values that cancel each other. This makes changes from the addition order easier to see. The percentages above are the largest differences, not the usual difference.
+
+## programs
+
+`splitk_layout.cu` is the main experiment. It records the value already stored in the output each time `atomicAdd` is called. This is used to recover the order in which the partial answers were added.
+
+`splitk_bench.cu` measures run-to-run differences.
+
+`splitk_rl.cu` checks changes to token log probabilities and a PPO-style calculation.
+
+`splitk_timing.cu` compares no split-K, atomic split-K and fixed-order split-K.
+
+`splitk_contend.cu` adds a background kernel. This only created light competition for the GPU, so its result should not be used to claim that other GPU work has no effect.
+
+`splitk_order.cu` records when blocks finish across the whole GPU. It is included for context, but this alone cannot show whether the blocks working on one output changed order.
+
+## run
+
+```bash
+./run_all.sh sm_100
 ```
-./run_all.sh sm_100        # sm_90 for H100, sm_89 for 4090
-```
 
-Everything builds first and stops on the first compile error, then runs, and the
-output lands in b200-final-results.txt with the commit hash, driver version and
-device string at the top. Every kernel launch is followed by cudaGetLastError and
-cudaDeviceSynchronize, because a launch that silently fails produces a table of
-perfect zeros that looks like a finding.
+Use `sm_90` for an H100 or `sm_89` for an RTX 4090.
 
-Split factor 1 is the control. Each block owns a distinct output element, so no
-two blocks accumulate into the same address and the result must be bit-exact. If
-a split=1 row ever varies, the harness is broken and nothing else means anything.
+The script builds every program before running them. Results are saved to `b200-final-results.txt`.
+
+Split factor 1 is the control. Every block has its own output, so there are no blocks competing to update the same value. If this result ever changes across runs, something is wrong with the test.
