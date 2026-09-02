@@ -2,7 +2,7 @@
 
 Atomic split-K can give different answers across runs. I wanted to measure when that actually happens and how large the differences are.
 
-## result
+## Result
 
 The block arrangement mattered a lot in this experiment.
 
@@ -23,7 +23,7 @@ The counts show how many outputs changed at least once across 200 runs on one B2
 
 The two-split result is also useful. The order changed, but every output still matched. This is because `a + b` gives the same result as `b + a`. With at least three partial answers, changing the order can also change where rounding happens.
 
-## the first test
+## The first test
 
 Before changing the block arrangement, I tested 96 combinations of:
 
@@ -36,7 +36,7 @@ Each setup was repeated 500 times. Every output matched. Sixteen of the 96 use a
 
 This first result did not mean atomic split-K was always repeatable. It meant this particular block arrangement kept adding the partial answers in the same order.
 
-## token probabilities
+## Token probabilities
 
 The RL test separates two different kinds of changes:
 
@@ -47,13 +47,13 @@ Repeating the same layout did not change the log probabilities.
 
 Switching between no split-K and split-K changed them by around `9.4e-7` to `1.9e-6`. This is a change caused by using different ways to do the calculation, not run-to-run nondeterminism.
 
-## speed
+## Speed
 
 Making the addition order fixed was around 0–2% slower than the atomic version in this test.
 
 Split-K itself did not help much at these matrix sizes. There was already enough work to use the B200, so adding more splits mostly added extra work.
 
-## limits
+## Limits
 
 These are small custom test kernels. Each block calculates one output using regular multiply-add instructions.
 
@@ -61,7 +61,7 @@ They do not use the tiled tensor-core kernels found in cuBLAS or CUTLASS. The re
 
 The inputs also included some unusually large values that cancel each other. This makes changes from the addition order easier to see. The percentages above are the largest differences, not the usual difference.
 
-## programs
+## Programs
 
 `splitk_layout.cu` is the main experiment. It records the value already stored in the output each time `atomicAdd` is called. This is used to recover the order in which the partial answers were added.
 
@@ -75,7 +75,7 @@ The inputs also included some unusually large values that cancel each other. Thi
 
 `splitk_order.cu` records when blocks finish across the whole GPU. It is included for context, but this alone cannot show whether the blocks working on one output changed order.
 
-## run
+## Run
 
 ```bash
 ./run_all.sh sm_100
