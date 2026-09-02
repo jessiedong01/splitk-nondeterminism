@@ -1,6 +1,6 @@
 # split-K nondeterminism
 
-Atomic split-K can give different answers across runs. I wanted to measure when that actually happens and how large the differences are.
+Atomic split-K can give different answers across runs. This measures when that actually happens and how large the differences are.
 
 ## Result
 
@@ -25,7 +25,7 @@ The two-split result is also useful. The order changed, but every output still m
 
 ## The first test
 
-Before changing the block arrangement, I tested 96 combinations of:
+Before changing the block arrangement, the benchmark covered 96 combinations of:
 
 - K size
 - number of splits
