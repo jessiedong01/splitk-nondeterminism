@@ -1,10 +1,8 @@
 # split-K nondeterminism
 
-Atomic split-K can give different answers across runs. This measures when that actually happens and how large the differences are.
+Atomic split-K can give different answers across runs. These tests measure how much of that depends on where the split blocks sit in the grid, and how large the differences get.
 
 ## Result
-
-The block arrangement mattered a lot in this experiment.
 
 When the blocks for each output were far apart, their partial answers were added in the same order every time. Every output matched across 200 runs.
 
