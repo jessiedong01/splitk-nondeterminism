@@ -1,94 +1,94 @@
 # split-K nondeterminism
 
-Does split-K GEMM with `atomicAdd` accumulation actually produce different
-results run to run, and does it matter for RL?
+Does split-K GEMM with atomicAdd accumulation actually produce a different
+answer run to run, and if it does, is the difference large enough to matter?
 
-## Scope, read this first
+## Result
 
-These are **custom microbenchmark kernels**, not production GEMMs. One output
-element per block, ordinary scalar FMA, a shared-memory tree reduction, and a
-single `atomicAdd` per block. No tiling, no tensor cores, no `tcgen05`, no
-CUTLASS, no cuBLAS.
+Nondeterminism in this kernel is decided by the block-to-element grid mapping,
+not by the number of splits. With the split index on the slowest-varying grid
+dimension, the partial sums for a given output arrive in the same order every
+time and the result is bit-identical across 200 runs. Moving the split index to
+the fastest-varying dimension puts those same partial sums next to each other in
+launch order, they race, and the result changes on every run. Same arithmetic,
+same split count, same inputs.
 
-Any result here describes **this kernel on this GPU while it is otherwise idle**.
-It does not establish how cuBLAS or CUTLASS split-K behave. Their block layouts,
-tile sizes, occupancy, and reduction strategies are different, and this
-experiment suggests those are exactly the things that decide the answer.
+| splits | blocks far apart | blocks adjacent | largest relative difference |
+|---:|---:|---:|---:|
+| 2 | 0 / 4096 | 0 / 4096 | none |
+| 4 | 0 / 4096 | 3015 / 4096 | 5.12e-05 |
+| 8 | 0 / 4096 | 4092 / 4096 | 1.33e-04 |
+| 32 | 0 / 4096 | 4096 / 4096 | 3.08e-04 |
+
+Counts are output elements that changed at least once across 200 runs on one
+B200, with identical inputs every time.
+
+The two-split row is the check that the measurement is honest. The arrival order
+changed for every element and the answer never moved, because two values add to
+the same result in either order. Floating-point addition is commutative; it is
+associativity that fails, and you need at least three terms before order can
+change anything.
+
+Before any of this was rearranged, the original benchmark ran 96 configurations
+of K, split factor, dtype and input distribution, 500 times each, and produced
+zero differing elements everywhere. That result was not measuring a quiet GPU.
+It was measuring the safe layout.
+
+For reinforcement learning, the harness separates two quantities that are easy
+to confuse. Run-to-run nondeterminism at a fixed split factor was exactly zero.
+The difference between a split=1 reduction and an atomic split-K reduction,
+which is what you see when generation and training use different kernels, was
+9.4e-07 to 1.9e-06 in logprob terms, far below the PPO clipping band.
+
+Fixed-order reduction cost 0 to 2 percent over the atomic version, so determinism
+is close to free here. Split-K itself bought nothing at these shapes, because
+4096 blocks already saturate 148 SMs.
+
+## Scope
+
+These are custom microbenchmark kernels: one output element per block, ordinary
+scalar FMA, a shared-memory tree reduction, one atomicAdd per block. No tiling,
+no tensor cores, no CUTLASS, no cuBLAS. Everything here describes this kernel on
+this GPU while it is otherwise idle, and says nothing about how a production
+GEMM behaves, since tile sizes, occupancy and reduction strategy are exactly the
+things this experiment suggests are decisive.
+
+The relative differences come from synthetic heavy-tailed inputs where large
+terms cancel and leave a small result, which is the regime where addition order
+matters most. They are maximums, not typical errors.
+
+The contention run tested only weak pressure on the reproducible layout and
+should not be read as evidence that contention has no effect.
 
 ## Programs
 
-| file | question |
-|---|---|
-| `splitk_bench.cu` | Does the output change across runs? ULP, absolute and relative error. |
-| `splitk_order.cu` | Do the blocks actually arrive in a different order each run? |
-| `splitk_layout.cu` | Does the block-to-element mapping change the answer? |
-| `splitk_rl.cu` | Logprob and PPO effects, run-to-run vs reduction-method. |
+`splitk_layout.cu` is the main experiment. It recovers the true accumulation
+order from the return value of the output atomicAdd, which is the accumulator
+value immediately before each split landed. Since C starts at zero, the split
+that saw zero went first, the one that saw the first partial went second, and
+walking that chain gives the real order. A separate counter cannot do this,
+because it is an independent atomic and a block can win the output atomicAdd and
+lose the counter race.
 
-## Two different quantities
+`splitk_bench.cu` measures run-to-run differences in ULPs and absolute and
+relative error. `splitk_rl.cu` reports logprob and PPO effects. `splitk_timing.cu`
+compares atomic, fixed-order and no split-K. `splitk_contend.cu` repeats the
+measurement with a background kernel resident. `splitk_order.cu` records global
+block arrival order and is kept only for context, since a scrambled global order
+does not show that the partials for one output swapped places.
 
-`splitk_rl` reports both, because they are easy to confuse:
-
-- **NONDET** — atomic run 0 vs atomic runs 1..N at the *same* split factor.
-  This is run-to-run nondeterminism.
-- **ALGO** — split=1 vs atomic split-K. This is the difference between two
-  reduction algorithms. It shows up when generation and training use different
-  kernels. It is deterministic and it is not nondeterminism.
-
-The PPO clip test seeds old-policy logprobs so ratios span [0.75, 1.25]. Starting
-every ratio at exactly 1.0 and asking whether numerical noise pushes it past
-0.8 or 1.2 is a rigged question with a guaranteed answer.
-
-## Build
-
-```
-nvcc -O3 -arch=sm_100 splitk_bench.cu  -o splitk_bench     # sm_90 for H100
-nvcc -O3 -arch=sm_100 splitk_order.cu  -o splitk_order
-nvcc -O3 -arch=sm_100 splitk_layout.cu -o splitk_layout
-nvcc -O3 -arch=sm_100 splitk_rl.cu     -o splitk_rl
-```
-
-`splits = 1` is the control. Each block owns a distinct output element, so no
-two blocks accumulate into the same address and the result must be bit-exact.
-If a `splits = 1` row shows any variation, the harness is broken.
-
-## Running everything
+## Running it
 
 ```
 ./run_all.sh sm_100        # sm_90 for H100, sm_89 for 4090
 ```
 
-Builds all six programs first and stops on the first compile error, so a typo
-costs a minute rather than a session. Every kernel launch is followed by
-`cudaGetLastError` + `cudaDeviceSynchronize`, because a launch that silently
-fails produces a table of perfect zeros that looks like a finding.
+Everything builds first and stops on the first compile error, then runs, and the
+output lands in b200-final-results.txt with the commit hash, driver version and
+device string at the top. Every kernel launch is followed by cudaGetLastError and
+cudaDeviceSynchronize, because a launch that silently fails produces a table of
+perfect zeros that looks like a finding.
 
-Output lands in `b200-final-results.txt` with the commit hash, driver version
-and device string at the top.
-
-## What each program answers
-
-- `splitk_order` — global block arrival order, via a counter. Kept for context
-  only. Weak on its own: a scrambled global order does **not** show that the
-  partials for one output element swapped places, and a counter is a second
-  independent atomic, so a block can win the output `atomicAdd` and lose the
-  counter race. That records an order which never happened.
-- `splitk_layout` — the real per-element measurement, and the exact one. The
-  probe uses the **return value of the output `atomicAdd`**: the accumulator
-  value immediately before each split was added. Since `C` starts at zero, the
-  split that saw `old == 0` went first, the one that saw `old == p_first` went
-  second, and walking that chain recovers the true accumulation order. Runs
-  under two block mappings (`s` slowest vs `s` fastest) and reports how often
-  the order changed across runs, plus an `ambig` rate for the rare cases where
-  two orders produce identical intermediates. Instrumented kernels are used
-  only for order study; `splitk_bench` stays uninstrumented.
-- `splitk_bench` — run-to-run differences: frequency, ULP, absolute, relative.
-- `splitk_rl` — NONDET vs ALGO, plus a synthetic clip-boundary test. Flip
-  counts are reported both as events out of `(runs-1) x tokens` and as distinct
-  tokens out of `tokens`. The headline is the perturbation window, not the flip
-  count: the seeded ratio grid is far coarser than the noise, so zero flips is
-  expected and says little.
-- `splitk_contend` — the same measurement idle and with a background kernel
-  resident. Scheduling pressure is the most likely way to expose variation.
-- `splitk_timing` — atomic split-K vs fixed-order split-K vs no split-K. This
-  is the cost of determinism **in this scalar microbenchmark**, not the general
-  cost of a deterministic GEMM.
+Split factor 1 is the control. Each block owns a distinct output element, so no
+two blocks accumulate into the same address and the result must be bit-exact. If
+a split=1 row ever varies, the harness is broken and nothing else means anything.
